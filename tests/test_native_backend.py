@@ -12,17 +12,20 @@ import pytest
 def backend(monkeypatch):
     abc = ModuleType("agent.web_search_provider")
     abc.WebSearchProvider = object
-    web = ModuleType("tools.web_tools")
+    web = ModuleType("hermes_cli.config")
     config = {"backend": "wsp"}
-    web._load_web_config = lambda: config
+    web.load_config = lambda: {"web": config}
     monkeypatch.setitem(sys.modules, "agent.web_search_provider", abc)
-    monkeypatch.setitem(sys.modules, "tools.web_tools", web)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", web)
     spec = importlib.util.spec_from_file_location(
         "_wsp_native_unit", Path(__file__).resolve().parents[1] / "native_backend.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    from wsp_core import extract
+
     engine = SimpleNamespace(
+        _extract=extract,
         load_config=lambda: {"auto_routing": {}},
         provider_configured=lambda *args: True,
         SEARCH_PROVIDER_IDS=("fixture",), EXTRACT_PROVIDER_IDS=("fixture",),
@@ -37,6 +40,16 @@ def backend(monkeypatch):
     )
     return SimpleNamespace(module=module, value=module.WSPNativeBackend(plugin),
                            plugin=plugin, config=config, engine=engine)
+
+
+@pytest.mark.parametrize("web", [{"extract_backend": "wsp"}, None, [], "wsp"])
+def test_web_config_uses_public_loader_and_always_returns_dict(backend, monkeypatch, web):
+    config = ModuleType("hermes_cli.config")
+    config.load_config = lambda: {"web": web}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    assert backend.module._load_web_config() == (web if isinstance(web, dict) else {})
+    config.load_config = Mock(side_effect=RuntimeError("unavailable"))
+    assert backend.module._load_web_config() == {}
 
 
 def test_no_implicit_selection(backend):
@@ -141,10 +154,10 @@ def test_exception_redaction(backend, caplog):
 def test_extract_association_and_missing_failures(backend):
     backend.plugin._run_extract.return_value = {"results": [
         {"url": "https://foreign.invalid", "content": "foreign"},
-        {"url": "https://second.invalid", "content": "second"},
+        {"url": "https://example.org/second", "content": "second"},
         {"url": "https://example.org", "error": "secret-dummy"},
     ]}
-    urls = ["https://example.org", "https://missing.invalid", "https://second.invalid"]
+    urls = ["https://example.org", "https://example.org/missing", "https://example.org/second"]
     result = backend.value.extract(urls)
     assert [r["url"] for r in result] == urls
     assert result[0]["error"] and result[1]["error"]
@@ -169,3 +182,69 @@ def test_registration_and_older_host(backend):
     assert backend.module.register_native_backend(object(), backend.plugin) is None
     ctx.register_web_search_provider.side_effect = RuntimeError("failure")
     assert backend.module.register_native_backend(ctx, backend.plugin) is None
+
+
+def _refused(row):
+    marker = row.get("blocked_by_policy")
+    return bool(marker) and "error" in row and not row.get("content")
+
+
+def test_extract_refused_url_carries_hermes_policy_marker_all_refused(backend):
+    # Whole-batch refusal: the engine returns a joined error and no rows.
+    backend.plugin._run_extract.return_value = {
+        "provider": "auto", "results": [],
+        "error": "Extraction URL blocked: 127.0.0.1 is private/internal",
+    }
+    urls = ["http://127.0.0.1/admin", "http://10.0.0.5/x"]
+    rows = backend.value.extract(urls)
+    assert [r["url"] for r in rows] == urls
+    assert all(_refused(r) for r in rows)
+    assert rows[0]["blocked_by_policy"]["host"] == "127.0.0.1"
+    assert "10.0.0.5" not in rows[0]["error"]
+
+
+def test_extract_refused_url_in_mixed_batch_is_marked_only_for_that_url(backend):
+    backend.plugin._run_extract.return_value = {"results": [
+        {"url": "https://example.org", "content": "ok"},
+        {"url": "http://localhost/", "title": "", "content": "",
+         "error": "Extraction URL blocked: localhost is private/internal"},
+        {"url": "https://example.org/down", "content": "", "error": "provider boom"},
+    ]}
+    rows = backend.value.extract(["https://example.org", "http://localhost/", "https://example.org/down"])
+    assert "blocked_by_policy" not in rows[0] and rows[0]["content"] == "ok"
+    assert _refused(rows[1])
+    # An ordinary provider failure must stay rescuable: no policy marker.
+    assert rows[2]["error"] and "blocked_by_policy" not in rows[2]
+
+
+def test_extract_ordinary_failures_never_get_policy_marker(backend):
+    # Only valid public URLs are rescuable. Invalid/non-HTTP input must not
+    # be forwarded to third-party rescue backends either.
+    for payload in (
+        {"results": [], "error": "All extraction providers failed"},
+        {"results": [{"url": "https://example.org", "error": "timeout"}]},
+    ):
+        backend.plugin._run_extract.return_value = payload
+        assert all("blocked_by_policy" not in r for r in backend.value.extract(["https://example.org"]))
+    backend.plugin._run_extract.side_effect = RuntimeError("boom")
+    assert all("blocked_by_policy" not in r for r in backend.value.extract(["https://example.org"]))
+
+
+def test_real_engine_private_url_returns_policy_marker(monkeypatch):
+    """End to end through the real plugin and engine: literal private IP, no network."""
+    from plugin_loader import load_plugin
+
+    plugin = load_plugin("wsp_plugin_native_rescue_under_test")
+    abc = ModuleType("agent.web_search_provider")
+    abc.WebSearchProvider = object
+    web = ModuleType("hermes_cli.config")
+    web.load_config = lambda: {"web": {"backend": "wsp"}}
+    monkeypatch.setitem(sys.modules, "agent.web_search_provider", abc)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", web)
+    spec = importlib.util.spec_from_file_location(
+        "_wsp_native_real", Path(__file__).resolve().parents[1] / "native_backend.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    rows = module.WSPNativeBackend(plugin).extract(["http://127.0.0.1:8080/secret", "http://192.168.1.10/"])
+    assert len(rows) == 2 and all(r.get("blocked_by_policy") for r in rows)

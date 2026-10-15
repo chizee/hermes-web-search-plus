@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Web Search Plus — Unified Multi-Provider Search and Extraction with Intelligent Auto-Routing
-Version: 5.1.0
+Version: 5.1.1
 Supports search providers: You.com, Serper, Exa, Firecrawl, Tavily, Linkup,
 Brave Search, SerpBase, Querit, Parallel, SearXNG, Keenable.
 Supports extract providers: Firecrawl, Linkup, Parallel, Tavily, Exa, You.com, Keenable, Serper.
@@ -36,7 +36,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, Tuple
 from .daemon_tasks import DaemonTask
-from .http_client import ProviderRequestError, request_timeout_cap
+from .http_client import ProviderRequestError, is_request_deadline_abort, request_timeout_cap
 from .cache import (
     CACHE_DIR,
     DEFAULT_CACHE_TTL,
@@ -1243,10 +1243,10 @@ def _execute_search_request_core(args, config: Dict[str, Any]) -> Tuple[Dict[str
                 provider_result = execute_search(prov)
             else:
                 provider_result = execute_provider_with_retry(prov, lambda: execute_search(prov))
-        except ProviderRequestError:
-            # Only real provider interactions count as performance signal;
-            # config/validation errors (e.g. missing keys) are not recorded.
-            record_provider_outcome(prov, latency_seconds=time.monotonic() - started, result_count=0, error=True)
+        except ProviderRequestError as exc:
+            # Caller-imposed deadlines are not provider performance samples.
+            if not is_request_deadline_abort(exc):
+                record_provider_outcome(prov, latency_seconds=time.monotonic() - started, result_count=0, error=True)
             raise
         record_provider_outcome(
             prov,
@@ -1308,6 +1308,11 @@ def _execute_search_request_core(args, config: Dict[str, Any]) -> Tuple[Dict[str
 
         diversity_rerank, near_duplicate_threshold = _diversity_settings(config)
         quorum_settings = _research_quorum_settings(config)
+        research_deadline = (
+            None
+            if args.research_time_budget is None
+            else time.monotonic() + float(args.research_time_budget)
+        )
         result = run_research_mode(
             query=args.query,
             research_providers=research_providers,
@@ -1317,6 +1322,7 @@ def _execute_search_request_core(args, config: Dict[str, Any]) -> Tuple[Dict[str
                 provider="auto",
                 output_format="markdown",
                 config=config,
+                max_wall_time_ms=_remaining_ms(research_deadline),
             ),
             max_results=args.max_results,
             max_extract_urls=args.research_extract_count,
@@ -1648,6 +1654,13 @@ def _search_args_from_v3(request: RequestV3, config: Dict[str, Any]):
     return args
 
 
+def _remaining_ms(deadline: Optional[float]) -> Optional[int]:
+    """Whole milliseconds left until a monotonic deadline (at least 1)."""
+    if deadline is None:
+        return None
+    return max(1, int((deadline - time.monotonic()) * 1000))
+
+
 def _execute_research_v3(
     request: RequestV3, plan: ProviderPlan, config: Dict[str, Any]
 ) -> CapabilityExecution:
@@ -1675,11 +1688,26 @@ def _execute_research_v3(
     operation_started: Dict[str, Tuple[float, float]] = {}
     timed_out_providers: set[str] = set()
     daily_budget = _daily_preflight_budget(config)
+    args = _search_args_from_v3(request, config)
+    time_budget_seconds = float(
+        request.options.get("research_time_budget")
+        or getattr(args, "research_time_budget", 55.0)
+    )
+    max_wall_time_ms = request.budget.get("max_wall_time_ms")
+    if (
+        isinstance(max_wall_time_ms, int)
+        and not isinstance(max_wall_time_ms, bool)
+        and max_wall_time_ms > 0
+    ):
+        time_budget_seconds = min(time_budget_seconds, max_wall_time_ms / 1000)
+    # One research deadline for members and the source extraction: an overdue
+    # member or a slow batch page starts no provider request after it.
+    deadline = time.monotonic() + time_budget_seconds
 
     for provider in providers:
         contexts[provider] = provider_attempt_context(
             store, provider, Capability.SEARCH, config.get(provider) or {}, get_api_key(provider, config),
-            budget_scope=scope, budget_limit_units=budget_limit, **daily_budget,
+            budget_scope=scope, budget_limit_units=budget_limit, deadline_monotonic=deadline, **daily_budget,
         )
 
     def execute_provider(provider: str) -> Dict[str, Any]:
@@ -1717,18 +1745,6 @@ def _execute_research_v3(
         payloads_by_provider[provider] = attempted.payload
         return attempted.payload
 
-    args = _search_args_from_v3(request, config)
-    time_budget_seconds = float(
-        request.options.get("research_time_budget")
-        or getattr(args, "research_time_budget", 55.0)
-    )
-    max_wall_time_ms = request.budget.get("max_wall_time_ms")
-    if (
-        isinstance(max_wall_time_ms, int)
-        and not isinstance(max_wall_time_ms, bool)
-        and max_wall_time_ms > 0
-    ):
-        time_budget_seconds = min(time_budget_seconds, max_wall_time_ms / 1000)
     diversity_rerank, near_duplicate_threshold = _diversity_settings(config)
     quorum_settings = _research_quorum_settings(config)
     payload = run_research_mode(
@@ -1739,6 +1755,12 @@ def _execute_research_v3(
             urls=urls,
             provider="auto",
             config=config,
+            max_wall_time_ms=_remaining_ms(deadline),
+            # Receipts and the request budget ledger of the extraction sit
+            # under the research request. A child scope keeps extraction's own
+            # attempt allowance: the members may already have used the
+            # research request's whole max_provider_attempts.
+            request_id=f"{scope}:extract",
         ),
         max_results=int(request.options.get("max_results") or 5),
         max_extract_urls=int(getattr(args, "research_extract_count", 3) or 3),
@@ -2000,7 +2022,9 @@ def _last_resort_probe(engine, store, provider, contexts, operation_for, race):
     context = contexts[provider]
     now = int(time.time())
     for error_class in (ErrorClass.TRANSIENT, ErrorClass.TIMEOUT):
-        store.record_success(context.circuit_key, error_class, now=now)
+        # Only end the open window; the failure counts stay until the probe
+        # actually succeeds (a budget-blocked or failed probe must not erase them).
+        store.expire_circuit(context.circuit_key, error_class, now=now)
     execution = engine.execute(context, operation_for(provider))
     receipts = [execution.receipt if r.provider == provider else r for r in race.receipts]
     payload = execution.payload
@@ -2150,8 +2174,12 @@ def _search_cache_vary(
     for it), so the cache key would equal that of a plain request while the
     provider call differs.
     """
+    from .cache import search_credential_context
+
     locale = (config.get("defaults") or {}).get("locale") or {}
-    return {"language": AUTO_LANGUAGE} if is_auto_language(locale.get("language")) else {}
+    vary: Dict[str, Any] = {"language": AUTO_LANGUAGE} if is_auto_language(locale.get("language")) else {}
+    vary["credential_scope"] = search_credential_context(plan.candidate_order, config)
+    return vary
 
 
 def _search_cache_write_eligible(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 
 import pytest
 
@@ -37,6 +38,11 @@ class FakeCtx:
 def config_path(tmp_path, monkeypatch):
     """Point the engine at an isolated config.json with no env keys set."""
     path = tmp_path / "config.json"
+    # These tests cover hosts without Hermes, where config.json keys still count
+    # (under Hermes they are ignored, see test_file_credentials_511). A Hermes venv
+    # has the real agent.secret_scope importable, so block it explicitly.
+    monkeypatch.setitem(sys.modules, "agent", None)
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", None)
     monkeypatch.setenv("WEB_SEARCH_PLUS_CONFIG", str(path))
     for key in (*wsp._PROVIDER_ENV_KEYS, "SEARXNG_INSTANCE_URL", "SEARXNG_ALLOW_PRIVATE"):
         monkeypatch.delenv(key, raising=False)
@@ -86,7 +92,15 @@ def test_config_json_searxng_base_url_enables_search_only(config_path, public_dn
     assert _check(ctx, "web_extract_plus") is False
 
 
-def test_desktop_searxng_url_enables_search(tmp_path, monkeypatch, public_dns):
+@pytest.mark.parametrize("scoped", [False, True])
+def test_desktop_searxng_url_enables_search(tmp_path, monkeypatch, public_dns, scoped):
+    from wsp_core.credentials import set_secret_resolver
+
+    # Desktop's shared file is usable only on standalone/old hosts. A profile
+    # with no endpoint must not inherit another profile's URL from that file.
+    monkeypatch.setattr(wsp, "_install_hermes_secret_resolver", lambda: set_secret_resolver(
+        (lambda _name, default=None: default) if scoped else None
+    ))
     # Hermes Desktop settings are read only for <home>/plugins/config.json and <home>/config.yaml.
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
@@ -106,7 +120,7 @@ def test_desktop_searxng_url_enables_search(tmp_path, monkeypatch, public_dns):
 
     ctx = _register()
 
-    assert _check(ctx, "web_search_plus") is True
+    assert _check(ctx, "web_search_plus") is (not scoped)
     assert _check(ctx, "web_extract_plus") is False
 
 

@@ -181,8 +181,10 @@ Secrets and behavior are intentionally separate:
 
 - Provider keys live in the Hermes profile (`hermes config set`, Hermes Desktop).
 - Routing behavior lives in `config.json`.
+- API keys do not belong in `config.json` under Hermes: store them with `hermes config set <PROVIDER>_API_KEY <key>`. Under Hermes a `api_key`/`apiKey` found in `config.json` is ignored (`hermes web-search-plus status` says so, without printing the value); the MCP server, OpenClaw skill and standalone CLI still read it. Status, `config show --json` and dry-run output never print key values.
+- DonSeTch also ignores `donsetch.api_key` as an executable path under Hermes. The explicit `donsetch.binary` field remains allowed because it is a path, not a secret; Hermes Desktop stores `donsetch_bin` in the profile's `config.yaml` settings and overlays that field. `DONSETCH_BIN` and forwarded `DONSETCH_*` values come through the active profile resolver. Additional variable names must be present in the process environment to be discovered (the resolver cannot list names); their process values are not used under Hermes. Standalone hosts keep the legacy `api_key` path fallback and environment behavior.
 - `WEB_SEARCH_PLUS_CONFIG=/path/to/config.json` can point runtime search at a custom config.
-- `setup.py --config-path /path/to/config.json` points the setup helper at a custom config.
+- `setup.py config <subcommand> --config-path /path/to/config.json` points a config subcommand at a custom config.
 
 Inspect routing:
 
@@ -244,7 +246,9 @@ Budget preflight is opt-in. Before a native v3 request starts any provider attem
 }
 ```
 
-Set a limit to `null` to leave that dimension unbounded. With `on_exceed: "degrade"`, WSP deterministically applies the smallest compatible cap; with `"abort"`, it returns a typed budget failure before a provider call. Daily usage is checked and recorded in the existing local v3 `budget_ledger`; an unavailable ledger fails closed when a daily quota is enabled. The receipt endpoint includes the typed checks and any reduction or abort reason. Set `WSP_BUDGET_PREFLIGHT_OFF=1` for an emergency process-level override; `0`, `false`, `no`, and `off` leave configured preflight enabled.
+Set a limit to `null` to leave that dimension unbounded. With `on_exceed: "degrade"`, WSP deterministically applies the smallest compatible cap; with `"abort"`, it returns a typed budget failure before a provider call. Daily usage is checked and recorded in the existing local v3 `budget_ledger`; an unavailable ledger fails closed when a daily quota is enabled. The per-request attempt cap (`max_provider_attempts`) lives in memory and stays enforced even when the state database is unavailable. The receipt endpoint includes the typed checks and any reduction or abort reason. Set `WSP_BUDGET_PREFLIGHT_OFF=1` for an emergency process-level override; `0`, `false`, `no`, and `off` leave configured preflight enabled.
+
+One unit of the request and daily budgets is one provider try that the attempt engine admits; a retry is a second unit. Most tries are one HTTP request. A batch extraction try (Firecrawl, Linkup, Serper, Keenable, DonSeTch) fetches each URL of the batch with its own request but counts as one unit. No provider request starts after the request deadline: a batch keeps the pages it already fetched and marks the rest `not tried: request ran out of time`.
 
 ### GroktoCrawl / local Firecrawl-compatible backends
 

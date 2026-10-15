@@ -19,17 +19,18 @@ It adds two Hermes tools:
 
 > Ported from [web-search-plus-plugin](https://github.com/robbyczgw-cla/web-search-plus-plugin) for the [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin API.
 
-Current release: **v5.1.0**. Version history: [Changelog](CHANGELOG.md).
+Current release: **v5.1.1**. Version history: [Changelog](CHANGELOG.md).
 
 ### What's new in 5.1
 
+- **5.1.1:** refused URLs stay out of Hermes' keyless rescue, provider keys stay in the active profile, and extraction returns one result per requested URL. See the [5.1.1 release notes](docs/RELEASE_NOTES_V511.md).
 - **Keys come through Hermes.** Web Search Plus reads provider keys from your active Hermes profile and no longer reads `.env` files itself. Store keys with `hermes config set BRAVE_API_KEY <key>` or in Hermes Desktop (Settings > Plugins > Web Search Plus). Keys kept only in the plugin folder's `.env` or `~/.hermes/plugins/.env` must move: see [Breaking changes in 5.1](CHANGELOG.md#breaking-changes).
 - **Setup runs inside Hermes.** `hermes web-search-plus status` and `hermes web-search-plus setup` show which keys the active profile sees and print the `hermes config set` command for each missing one.
 - **Research mode says why a provider was skipped**, for example "Out of credits", instead of "did not return a payload".
 
 ### What's new in 5.0
 
-- **Faster.** Measured on 294 live queries, the median search takes 565 ms instead of 930 ms, and the slowest one 2.1 s instead of 22 s. When a provider hangs or answers empty, the next one starts after at most 2.5 s.
+- **Faster.** Measured on 294 live queries, the median search takes 565 ms instead of 930 ms, and the slowest one 2.1 s instead of 22 s. When a provider fails or answers empty, the next one starts at once; when it hangs, the next one starts after its usual (p75) latency, at least 2.5 s and at most 10 s.
 - **Better results.** Two blind judges compared 4.3.5 and 5.0 answer by answer and preferred 5.0 in about two thirds of the queries, in all eight query types.
 - **Shorter answers.** Results are about 35 % shorter for the agent; the source a query asks for is found as often as before.
 - **Searches in the query's language.** A clearly German or French query is searched in German or French, unless you set a language yourself.
@@ -179,6 +180,7 @@ The full reference, including the normative v3 contracts for implementers and re
 - [Provider Privacy & Terms](https://websearchplus.xyz/providers.html#privacy-terms) — provider-specific training, retention, ZDR, and contract caveats
 - [Routing Reference](docs/ROUTING.md) — generated: how the first provider is chosen per query type
 - [Operator Console](docs/V3_OPERATOR_CONSOLE.md) — local read-only visibility and troubleshooting
+- [Native Hermes backend](docs/NATIVE_BACKEND.md) — opt-in `wsp` backend for Hermes' own `web_search`/`web_extract`, and Hermes' keyless rescue
 - [Provider Benchmarks](docs/V3_BENCHMARKS.md) — search and extraction comparison with privacy and quota guidance
 - [FAQ](docs/FAQ.md) — provider selection, cache, cost, and common setup problems
 

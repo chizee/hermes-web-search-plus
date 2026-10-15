@@ -1,11 +1,11 @@
 """
-web-search-plus — Hermes Plugin v5.1.0
+web-search-plus — Hermes Plugin v5.1.1
 Multi-provider web search, URL extraction, quality reports, and opt-in research mode.
 Ported from robbyczgw-cla/web-search-plus-plugin (OpenClaw) to Hermes Plugin API.
 """
 from __future__ import annotations
 
-__version__ = "5.1.0"
+__version__ = "5.1.1"
 
 import argparse
 import importlib
@@ -43,7 +43,14 @@ from .wsp_core.provider_registry import (
     keyless_public_env_var,
     plugin_catalog,
 )
-from .wsp_core.credentials import get_secret, get_secret_resolver, is_secret_scope_error, set_secret_resolver
+from .wsp_core.credentials import (
+    file_credentials_allowed,
+    get_secret,
+    get_secret_resolver,
+    is_secret_scope_error,
+    redact_secrets,
+    set_secret_resolver,
+)
 from .wsp_core.env_loader import clean_env_value as _shared_clean_env_value, is_truthy
 from .wsp_core.cache import MAX_STORED_TEXT_CHARS, store_web_text
 from .wsp_core.config import (
@@ -52,7 +59,10 @@ from .wsp_core.config import (
     _apply_desktop_settings,
     _desktop_settings,
     _replace_pre_5_default_priority,
+    _warn_ignored_file_key,
     apply_profile_effects,
+    ignored_file_credential_notice,
+    ignored_file_credentials,
     load_config,
     provider_configured,
 )
@@ -125,6 +135,30 @@ def _ensure_hermes_secret_resolver() -> None:
         _install_hermes_secret_resolver()
 
 
+def _section_file_key(section: Mapping[str, Any]) -> str:
+    """The ``api_key``/``apiKey`` from a config.json section, or "" when a host resolver owns credentials."""
+    if not file_credentials_allowed():
+        return ""
+    return str(section.get("api_key") or section.get("apiKey") or "")
+
+
+def _raw_config_json(path: Path) -> Dict[str, Any]:
+    """config.json as written (any section), or {} when missing or unreadable; used only to detect ignored keys."""
+    try:
+        raw = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _ignored_file_credential_lines(config: Optional[Mapping[str, Any]]) -> List[str]:
+    """Status lines for config.json keys that are ignored under Hermes (never the value); also warns once."""
+    providers = ignored_file_credentials(dict(config or {}))
+    for provider in providers:
+        _warn_ignored_file_key(provider)
+    return [ignored_file_credential_notice(provider) for provider in providers]
+
+
 def _provider_config_status(env: Optional[Mapping[str, str]] = None, config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Describe configured providers by capability tier.
 
@@ -143,7 +177,7 @@ def _provider_config_status(env: Optional[Mapping[str, str]] = None, config: Opt
         section = (config or {}).get(spec.config_section, {})
         section = section if isinstance(section, Mapping) else {}
         configured = _clean_env_value(
-            str(section.get("api_key") or section.get("apiKey") or (section.get("binary") if spec.provider == "donsetch" else None) or env.get(key) or "")
+            str(_section_file_key(section) or (section.get("binary") if spec.provider == "donsetch" else None) or env.get(key) or "")
         ) is not None
         if spec.provider == "searxng":
             configured = _is_well_formed_http_url(section.get("base_url") or section.get("instance_url") or env.get(key))
@@ -197,7 +231,12 @@ def _get_plugin_config_path() -> Path:
 
 def _get_hermes_config_path() -> Path:
     """Return the default Hermes config path inspected by the fast-path doctor."""
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    else:
+        home = Path(get_hermes_home())
     return Path(os.environ.get("HERMES_CONFIG") or home / "config.yaml")
 
 
@@ -264,8 +303,8 @@ def _yamlish_nested_list_item(text: str, parent: str, key: str, item: str) -> bo
     return False
 
 
-def _native_backend_hints(text: str) -> List[str]:
-    """Inspect native backend pins; stdlib setup supports simple block YAML.
+def _hermes_web_settings(text: str) -> Dict[str, Any]:
+    """Read the ``web:`` block of Hermes config text; advisory and read-only.
 
     Use the real YAML parser when installed (as it is in Hermes), retaining a
     conservative block-scalar fallback for standalone, dependency-free setup.
@@ -275,29 +314,98 @@ def _native_backend_hints(text: str) -> List[str]:
         import yaml
     except ImportError:
         web: Dict[str, Any] = {}
+        # This fallback handles scalar web settings, not arbitrary YAML. Keep
+        # quoted strings as strings: YAML 1.1 'false' is truthy, unlike false.
+        scalar = r"(?:'[^']*(?:''[^']*)*'|\"(?:\\.|[^\"\\])*\"|[^,{}#\n]*)"
+        field = r"(backend|search_backend|extract_backend|keyless_rescue|keyless_fallback)"
+
+        def add(name: str, raw: str) -> None:
+            raw = raw.strip()
+            if raw.startswith(("'", '"')):
+                value = raw[1:-1]
+            elif raw in {"", "~", "null", "Null", "NULL"}:
+                value = None
+            elif raw in {"true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON"}:
+                value = True
+            elif raw in {"false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF"}:
+                value = False
+            elif re.fullmatch(r"[-+]?0+(?:\.0+)?", raw):
+                value = 0
+            else:
+                value = raw
+            web[name] = value
+
+        flow = re.search(r"(?m)^web:\s*\{([^{}]*)\}", text)
+        if flow:
+            for match in re.finditer(rf"(?:^|,)\s*{field}:\s*({scalar})", flow[1]):
+                add(match[1], match[2])
+            return web
         in_web = False
+        child_indent = None
         for line in text.splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             if not line[0].isspace():
                 in_web = bool(re.fullmatch(r"web:\s*(?:#.*)?", line))
+                child_indent = None
                 continue
             if in_web:
-                match = re.fullmatch(
-                    r"\s+(backend|search_backend|extract_backend):\s*['\"]?([a-z0-9_-]+)['\"]?\s*(?:#.*)?", line
-                )
-                if match:
-                    web[match[1]] = match[2]
-    else:
-        try:
-            data = yaml.safe_load(text)
-            web = data.get("web", {}) if isinstance(data, dict) else {}
-            if not isinstance(web, dict):
-                web = {}
-        except yaml.YAMLError:
-            web = {}
+                indent = len(line) - len(line.lstrip())
+                if child_indent is None:
+                    child_indent = indent
+                match = re.fullmatch(rf"\s+{field}:\s*({scalar})\s*(?:#.*)?", line)
+                if indent == child_indent and match:
+                    add(match[1], match[2])
+        return web
+    try:
+        data = yaml.safe_load(text)
+        web = data.get("web", {}) if isinstance(data, dict) else {}
+        return web if isinstance(web, dict) else {}
+    except yaml.YAMLError:
+        return {}
+
+
+def _native_backend_hints(text: str) -> List[str]:
+    """Capabilities (``search``/``extract``) that Hermes config pins to ``wsp``."""
+    web = _hermes_web_settings(text)
     return [kind for kind in ("search", "extract")
             if (web.get(kind + "_backend") or web.get("backend")) == "wsp"]
+
+
+_KEYLESS_RESCUE_OFF_COMMAND = "hermes config set web.keyless_rescue false"
+
+
+def _keyless_rescue_state(text: str) -> Dict[str, Any]:
+    """Whether Hermes may re-send a failed native ``wsp`` call to its keyless ring.
+
+    Mirrors Hermes' gate: ``web.keyless_rescue`` (default on) and
+    ``web.keyless_fallback`` (default on) must both be on. Read-only; a missing
+    or unreadable config means the Hermes defaults, i.e. on.
+    """
+    web = _hermes_web_settings(text)
+    capabilities = _native_backend_hints(text)
+    rescue = bool(web.get("keyless_rescue", True)) and bool(web.get("keyless_fallback", True))
+    return {
+        "native_selected": bool(capabilities),
+        "native_capabilities": capabilities,
+        "keyless_rescue": rescue,
+        "how_to_disable": _KEYLESS_RESCUE_OFF_COMMAND,
+        "explanation": (
+            "Hermes re-sends a failed native `wsp` web_search/web_extract call, with its query or URL, to "
+            "anonymous keyless backends (Exa, Parallel, Firecrawl, Keenable). "
+            + ("Turn it off: " + _KEYLESS_RESCUE_OFF_COMMAND
+               if rescue else "Disabled (web.keyless_rescue or web.keyless_fallback is false).")
+        ),
+    }
+
+
+def _hermes_keyless_rescue_state(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """:func:`_keyless_rescue_state` for the Hermes config.yaml on disk; never writes it."""
+    try:
+        text = (config_path or _get_hermes_config_path()).read_text()
+    except OSError:
+        text = ""
+    return _keyless_rescue_state(text)
 
 
 def _build_fastpath_report(config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -363,6 +471,7 @@ def _build_fastpath_report(config_path: Optional[Path] = None) -> Dict[str, Any]
         "native_capabilities": native_capabilities,
         "preferred_web_path_configured": preferred,
         "hermes_config": str(config_path),
+        "keyless_rescue": _keyless_rescue_state(config_text),
         "checks": checks,
         "recommended_hermes_config": {} if native_capabilities else {
             "agent.disabled_toolsets": ["web"],
@@ -373,6 +482,17 @@ def _build_fastpath_report(config_path: Optional[Path] = None) -> Dict[str, Any]
             "No local Hermes core patches are required; this doctor only recommends config that exists in current Hermes.",
         ],
     }
+
+
+def _render_keyless_rescue(state: Mapping[str, Any]) -> List[str]:
+    """Human lines for the native-backend / Hermes keyless-rescue state."""
+    if not state.get("native_selected"):
+        return ["Native wsp backend: not selected (Hermes keyless rescue does not apply to WSP)."]
+    caps = ", ".join(state.get("native_capabilities") or [])
+    return [
+        f"Native wsp backend: selected for {caps}. Hermes keyless rescue: {'ON' if state.get('keyless_rescue') else 'off'}.",
+        f"  {state.get('explanation')}",
+    ]
 
 
 def _render_fastpath_report(report: Mapping[str, Any]) -> str:
@@ -394,6 +514,8 @@ def _render_fastpath_report(report: Mapping[str, Any]) -> str:
             "Native WSP selected for: " + ", ".join(report.get("native_capabilities", [])),
             "Keep the Hermes web toolset enabled. This check inspects config only;",
             "plugin registration and provider readiness require a runtime smoke.",
+            "",
+            *_render_keyless_rescue(report.get("keyless_rescue") or {}),
         ])
         return "\n".join(lines)
     lines.extend([
@@ -725,9 +847,19 @@ def _write_behavior_config(path: Path, data: Mapping[str, Any], *, dry_run: bool
             ):
                 auto.pop(field, None)
             merged["auto_routing"] = auto
-    rendered = json.dumps(merged, indent=2, sort_keys=True) + "\n"
     if dry_run:
-        print(rendered, end="")
+        def changed(before: Mapping[str, Any], after: Mapping[str, Any]) -> Dict[str, Any]:
+            delta: Dict[str, Any] = {key: None for key in before if key not in after}
+            for key, value in after.items():
+                if key not in before or before[key] != value:
+                    if isinstance(value, Mapping) and isinstance(before.get(key), Mapping):
+                        value = changed(before[key], value)
+                    delta[key] = value
+            return delta
+
+        # Compare effective values, not defaults newly materialized on disk.
+        preview = changed(_load_behavior_config(path), _merge_behavior_config(merged))
+        print(json.dumps(redact_secrets(preview), indent=2, sort_keys=True) + "\n", end="")
         return
     if backup and path.exists():
         backup_path = _unique_timestamped_path(path, "bak")
@@ -791,7 +923,7 @@ def _profile_status(config: Mapping[str, Any], env: Mapping[str, str]) -> Dict[s
     keenable = config.get("keenable", {}) if isinstance(config.get("keenable"), Mapping) else {}
     keenable_ready = bool(
         _clean_env_value(env.get("KEENABLE_API_KEY") or "")
-        or _clean_env_value(str(keenable.get("api_key") or keenable.get("apiKey") or ""))
+        or _clean_env_value(_section_file_key(keenable))
         or is_truthy(keenable.get("allow_public"))
         or is_truthy(env.get(keyless_public_env_var("keenable")))
     )
@@ -840,15 +972,22 @@ def _donsetch_status(env: Mapping[str, str], config: Mapping[str, Any]) -> Dict[
     return inspect(key=_clean_env_value(env.get("DONSETCH_BIN") or ""), config=dict(config))
 
 
-def _status_payload(env: Optional[Mapping[str, str]] = None, config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+def _status_payload(
+    env: Optional[Mapping[str, str]] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    hermes_config_path: Optional[Path] = None,
+    raw_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     active_env = env if env is not None else _credential_env()
     active_config = dict(config or _default_behavior_config())
     return {
         "providers": _provider_config_status(active_env, active_config),
         "profile": _profile_status(active_config, active_env),
-        "routing": active_config,
+        "routing": redact_secrets(active_config),
+        "ignored_file_keys": _ignored_file_credential_lines(raw_config if raw_config is not None else active_config),
         "donsetch": _donsetch_status(active_env, active_config),
         "jev": jev_setup.status_payload(active_env, active_config),
+        "hermes_native": _hermes_keyless_rescue_state(hermes_config_path),
     }
 
 
@@ -1246,7 +1385,7 @@ def _handle_config_command(args: Any) -> None:
 
     if subcommand == "show":
         if getattr(args, "json", False):
-            print(json.dumps(config, indent=2, sort_keys=True))
+            print(json.dumps(redact_secrets(config), indent=2, sort_keys=True))
         else:
             print(_routing_summary(config))
         return
@@ -1355,12 +1494,15 @@ def _web_search_plus_cli_command(args: Any) -> None:
         # settings, which the engine lays over it at load time. Never written back.
         desktop = _desktop_settings(path)
         config = _apply_desktop_settings(json.loads(json.dumps(_load_behavior_config(path))), desktop)
-        payload = _status_payload(env, config)
+        payload = _status_payload(env, config, raw_config=_raw_config_json(path))
         if getattr(args, "json", False):
-            print(json.dumps(payload, indent=2, sort_keys=True))
+            print(json.dumps(redact_secrets(payload), indent=2, sort_keys=True))
         else:
             print(_render_setup_guidance(env=env, fancy=not getattr(args, "plain", False), config=config))
             print("\n" + _routing_summary(config))
+            for notice in payload.get("ignored_file_keys") or []:
+                print("  ! " + notice)
+            print("\n" + "\n".join(_render_keyless_rescue(payload["hermes_native"])))
             if desktop:
                 print("  from Hermes Desktop settings: " + ", ".join(sorted(desktop)))
             donsetch = payload.get("donsetch") or {}
@@ -1406,6 +1548,8 @@ def _web_search_plus_cli_command(args: Any) -> None:
                 key_commands.append(_hermes_set_command(item))
         print(f"\nRouting config file: {config_path}")
         print(_routing_summary(config))
+        for notice in _ignored_file_credential_lines(_raw_config_json(config_path)):
+            print("  ! " + notice)
         if getattr(args, "jev", False):
             want_jev = True
         elif getattr(args, "no_jev", False):
@@ -1735,9 +1879,18 @@ def _run_extract(
     try:
         return _call_with_timeout(call, timeout)
     except FuturesTimeout:
-        return {"error": f"Extract timed out after {timeout}s", "provider": provider, "results": []}
+        failure = {"error": f"Extract timed out after {timeout}s", "provider": provider, "results": []}
     except Exception as e:
-        return {"error": str(e), "provider": provider, "results": [], **_scope_error_type(e)}
+        failure = {"error": str(e), "provider": provider, "results": [], **_scope_error_type(e)}
+    # The wrapper may fail before the engine can return its refusal metadata.
+    try:
+        checked = search._extract._check_extract_urls(urls, search.load_config())
+        refused = [url for url, _validated, error in checked if error is not None]
+        if refused:
+            failure["refused_urls"] = refused
+    except Exception:
+        pass  # Preserve the original failure (including credential-scope errors).
+    return failure
 
 
 def _source_total_chars(src: dict, shown: int) -> int:
@@ -1994,6 +2147,15 @@ def _clean_tool_provider(value: Any) -> tuple:
     return provider, f"Search error: unknown provider {value!r}. Valid providers: {valid}"
 
 
+def _clean_tool_extract_provider(value: Any) -> tuple:
+    """Return (provider, error) for web_extract_plus. Case and surrounding spaces do not matter."""
+    provider = str(value or "").strip().lower() or "auto"
+    if provider == "auto" or provider in EXTRACT_PROVIDER_IDS:
+        return provider, None
+    valid = ", ".join(["auto", *EXTRACT_PROVIDER_IDS])
+    return provider, f"Extract error: unknown provider {value!r}. Valid providers: {valid}"
+
+
 def _configured_max_results(fallback: int = 5) -> int:
     """Return defaults.max_results clamped to the tool range, or the fallback."""
     try:
@@ -2141,7 +2303,15 @@ def _install_hermes_secret_resolver() -> None:
     global _HERMES_RESOLVER_FALLBACK_LOGGED
     try:
         from agent.secret_scope import get_secret as hermes_get_secret
-    except ImportError:
+    except Exception as exc:
+        if not isinstance(exc, ModuleNotFoundError) or exc.name not in {"agent", "agent.secret_scope"}:
+            def unavailable(_name: str, _default: Optional[str] = None) -> Optional[str]:
+                raise RuntimeError("Hermes credential scope unavailable; credential reads disabled")
+
+            set_secret_resolver(unavailable)
+            # Import errors may contain sensitive paths or configuration values.
+            logger.warning("web-search-plus: Hermes credential scope unavailable; credential reads disabled")
+            return
         set_secret_resolver(None)
         if not _HERMES_RESOLVER_FALLBACK_LOGGED:
             _HERMES_RESOLVER_FALLBACK_LOGGED = True
@@ -2407,6 +2577,9 @@ def register(ctx: Any) -> None:
             urls = args_or_urls
         if isinstance(urls, str):
             urls = [urls]
+        provider, provider_error = _clean_tool_extract_provider(provider)
+        if provider_error:
+            return provider_error
         data = _run_extract(
             urls=urls,
             provider=provider,

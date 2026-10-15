@@ -15,17 +15,70 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from agent.web_search_provider import WebSearchProvider
-from tools.web_tools import _load_web_config
 
 logger = logging.getLogger(__name__)
+
+try:  # package import (Hermes); the standalone unit-test load has no parent
+    from .wsp_core.extract_match import match_extract_items as _match_extract_items
+except ImportError:  # pragma: no cover - exercised only outside the package
+    _match_extract_items = None
+
+
+def _load_web_config() -> Dict[str, Any]:
+    """Read optional web settings through Hermes' public config API."""
+    try:
+        from hermes_cli.config import load_config
+
+        web = load_config().get("web") or {}
+        return web if isinstance(web, dict) else {}
+    except Exception:  # noqa: BLE001 — unavailable/malformed config is optional
+        return {}
+
+
+def _match_rows(urls: List[str], rows: List[Dict[str, Any]]) -> List[Optional[Dict[str, Any]]]:
+    """Pair engine rows with requested URLs (exact, canonical, reported source URL)."""
+    if _match_extract_items is not None:
+        return _match_extract_items(urls, rows)[0]
+    by_url: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        by_url.setdefault(row["url"], row)
+    return [by_url.get(url) for url in urls]
 
 # WSP engine hard-cap (matches web_search_plus schema maximum).
 _WSP_MAX_RESULTS = 20
 
 _NATIVE_BACKEND_NAME = "wsp"
 _NATIVE_DISPLAY_NAME = "Web Search Plus (native)"
+
+# Prefix of every error the engine's URL guard raises for a target it refused on
+# purpose (private/internal address, blocked name, unresolvable host).
+_URL_REFUSED_PREFIX = "Extraction URL blocked"
+_URL_REFUSED_MESSAGE = (
+    "Blocked by Web Search Plus URL policy: private/internal or unresolvable address"
+)
+
+
+def _refused_entry(url: str) -> Dict[str, Any]:
+    """Error entry carrying Hermes' ``blocked_by_policy`` marker.
+
+    Hermes' one-shot keyless rescue (``web.keyless_rescue``) re-sends failed
+    extract items to anonymous third-party backends, except entries with a
+    truthy ``blocked_by_policy`` (tools/web_tools_rescue.py). A URL WSP refused
+    on purpose must not be forwarded there. Only the requested host is named,
+    never a resolved address.
+    """
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        host = ""
+    return {
+        "url": url,
+        "error": _URL_REFUSED_MESSAGE,
+        "blocked_by_policy": {"host": host, "rule": "wsp-url-guard", "source": "web-search-plus"},
+    }
 
 
 class WSPNativeBackend(WebSearchProvider):
@@ -236,6 +289,21 @@ class WSPNativeBackend(WebSearchProvider):
                 for url in url_list
             ]
 
+        # Keep policy refusals outside provider execution: even a timeout or
+        # malformed engine response must not make these URLs rescuable.
+        try:
+            engine = self.plugin._load_search_module()
+            checked = engine._extract._check_extract_urls(url_list, engine.load_config())
+        except Exception:  # noqa: BLE001 — never dispatch without URL validation
+            return [{"url": url, "error": "WSP native URL validation failed"} for url in url_list]
+        accepted = [validated for _url, validated, error in checked if error is None]
+        rows = iter(self._extract_accepted(accepted, kwargs) if accepted else [])
+        return [
+            _refused_entry(url) if error is not None else {**next(rows), "url": url}
+            for url, _validated, error in checked
+        ]
+
+    def _extract_accepted(self, url_list: List[str], kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
         run = getattr(self.plugin, "_run_extract")
         output_format = kwargs.get("format") or "markdown"
         try:
@@ -255,6 +323,10 @@ class WSPNativeBackend(WebSearchProvider):
             ]
 
         if data.get("error") and not data.get("results"):
+            if _URL_REFUSED_PREFIX in str(data["error"]):
+                # Every URL failed the engine's pre-flight check; the joined error
+                # cannot be mapped back to single URLs, so none may be rescued.
+                return [_refused_entry(url) for url in url_list]
             message = self._failure_message(data, "WSP native extraction failed; check provider readiness and configuration")
             return [{"url": url, "error": message} for url in url_list]
 
@@ -262,43 +334,53 @@ class WSPNativeBackend(WebSearchProvider):
         if not isinstance(results, list):
             return [{"url": url, "error": "WSP native extract returned no results"} for url in url_list]
 
-        # Bind every returned row to an explicitly requested URL. Never relabel
-        # unrelated content or silently drop requested failures.
-        by_url: Dict[str, Dict[str, Any]] = {}
-        for row in results:
-            if not isinstance(row, dict) or not isinstance(row.get("url"), str):
-                continue
-            url = row["url"]
-            if url not in url_list or url in by_url:
-                continue
-            content = row.get("content", row.get("markdown", ""))
-            if not isinstance(content, str):
-                by_url[url] = {"url": url, "error": "WSP native extract returned malformed content"}
-                continue
-            normalized = {"url": url, "content": content}
-            for key in ("title", "raw_content"):
-                if isinstance(row.get(key), str):
-                    normalized[key] = row[key]
-            if row.get("error"):
-                normalized["error"] = "WSP extraction failed for this URL"
-            metadata = {key: row[key] for key in (
-                "fetcher", "status", "quality", "lang", "source_type", "page_type",
-                "next_offset", "truncated", "original_content_length",
-            ) if key in row}
-            full_text = row.get("full_text")
-            if isinstance(full_text, dict) and full_text.get("truncated"):
-                # Content was cut to the context budget: say so, with the real
-                # length when known, instead of passing it off as the whole page.
-                metadata["truncated"] = True
-                if isinstance(full_text.get("original_chars"), int):
-                    metadata["original_content_length"] = full_text["original_chars"]
-                if full_text.get("stored") and full_text.get("path"):
-                    metadata["full_text_path"] = full_text["path"]
-            if metadata:
-                normalized["metadata"] = metadata
-            by_url[url] = normalized
-        return [by_url.get(url, {"url": url, "error": "WSP native extract returned no matching result"})
-                for url in url_list]
+        # Bind every returned row to an explicitly requested URL: exact, then
+        # normalised (canonical), then the source URL the provider reports.
+        # Never relabel unrelated content or silently drop requested failures;
+        # exactly one result per requested URL, in request order.
+        rows = [row for row in results if isinstance(row, dict) and isinstance(row.get("url"), str)]
+        matched = _match_rows(url_list, rows)
+        return [
+            self._normalize_row(url, row) if row is not None
+            else {"url": url, "error": "WSP native extract returned no matching result"}
+            for url, row in zip(url_list, matched)
+        ]
+
+    def _normalize_row(self, url: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        # The result carries the requested URL: Hermes correlates by it, and a
+        # redirect target or punycode form would not match what was asked.
+        if row.get("error") and str(row["error"]).startswith(_URL_REFUSED_PREFIX):
+            # Refused by WSP's URL guard on purpose: Hermes must not rescue it.
+            return _refused_entry(url)
+        content = row.get("content", row.get("markdown", ""))
+        if not isinstance(content, str):
+            if not row.get("error"):
+                return {"url": url, "error": "WSP native extract returned malformed content"}
+            # An error row legitimately has no content (``content: None``);
+            # report its error, not a content-shape problem.
+            content = ""
+        normalized = {"url": url, "content": content}
+        for key in ("title", "raw_content"):
+            if isinstance(row.get(key), str):
+                normalized[key] = row[key]
+        metadata = {key: row[key] for key in (
+            "fetcher", "status", "quality", "lang", "source_type", "page_type",
+            "next_offset", "truncated", "original_content_length",
+        ) if key in row}
+        full_text = row.get("full_text")
+        if isinstance(full_text, dict) and full_text.get("truncated"):
+            # Content was cut to the context budget: say so, with the real
+            # length when known, instead of passing it off as the whole page.
+            metadata["truncated"] = True
+            if isinstance(full_text.get("original_chars"), int):
+                metadata["original_content_length"] = full_text["original_chars"]
+            if full_text.get("stored") and full_text.get("path"):
+                metadata["full_text_path"] = full_text["path"]
+        if row.get("error"):
+            normalized["error"] = "WSP extraction failed for this URL"
+        if metadata:
+            normalized["metadata"] = metadata
+        return normalized
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
