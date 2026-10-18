@@ -417,7 +417,7 @@ def urlopen(req, timeout: float = 30):
     return _pooled_open(req, timeout)
 
 
-DEFAULT_USER_AGENT = "ClawdBot-WebSearchPlus/5.1.1"
+DEFAULT_USER_AGENT = "ClawdBot-WebSearchPlus/5.1.2"
 
 
 class ProviderRequestError(Exception):
@@ -439,6 +439,21 @@ class ProviderRequestError(Exception):
         # The provider account is empty. status_code stays the provider's real
         # status (Linkup answers 429, Serper 400); this flag drives QUOTA.
         self.out_of_credit = out_of_credit
+
+
+class ProviderBatchStopped(Exception):
+    """A provider-wide error (rate limit, quota, auth) stopped a batch midway.
+
+    ``payload`` keeps the pages fetched before the stop, with error items for
+    the rest. The attempt engine records ``cause`` for retry and circuit state
+    like any failure, keeps the payload and never retries the batch: that
+    would pay again for pages already fetched.
+    """
+
+    def __init__(self, cause: BaseException, payload: dict):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.payload = payload
 
 
 class RequestDeadlineExceeded(ProviderRequestError, TimeoutError):

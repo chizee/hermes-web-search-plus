@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 
 import pytest
 
@@ -165,3 +166,51 @@ def test_redact_secrets_masks_any_secret_field_and_keeps_the_rest():
     assert redacted["env"]["max_tokens"] == 5
     assert redacted["name"] == "keep"
     assert data["serper"]["api_key"] == FILE_KEY  # input untouched
+
+
+SEARXNG_URL = "https://user:pass-SECRET@search.example.net/path"
+
+
+def _settings_config():
+    return {"version": 1, "keenable": {"allow_public": True}, "searxng": {"base_url": SEARXNG_URL}}
+
+
+def test_ignored_settings_reported_under_resolver_without_url(tmp_path, monkeypatch, capsys, caplog):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_settings_config()))
+    _resolver(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        _run_cli(["status", "--config-path", str(path)])
+        _run_cli(["status", "--json", "--config-path", str(path)])
+    out = capsys.readouterr().out
+    assert "keenable.allow_public; it is ignored" in out
+    assert "hermes config set KEENABLE_ALLOW_PUBLIC 1" in out
+    assert "hermes config set SEARXNG_INSTANCE_URL" in out
+    assert "pass-SECRET" not in out
+    assert "pass-SECRET" not in caplog.text and "search.example.net" not in caplog.text
+    assert len([r for r in caplog.records if "keenable.allow_public" in r.getMessage()]) == 1
+    payload = json.loads(out[out.index('{'):])
+    assert len(payload["ignored_file_settings"]) == 2
+    assert not any("search.example.net" in n or "pass-SECRET" in n for n in payload["ignored_file_settings"])
+    assert "ignored_file_keys" in payload
+
+
+def test_ignored_settings_silent_without_resolver(tmp_path, capsys, monkeypatch):
+    # Hermetic on machines with Hermes installed: status would install the
+    # real resolver when agent.secret_scope is importable.
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", None)
+    monkeypatch.setattr(wsp, "_install_hermes_secret_resolver", lambda: None)
+    assert credentials.get_secret_resolver() is None
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_settings_config()))
+    _run_cli(["status", "--json", "--config-path", str(path)])
+    out = capsys.readouterr().out
+    assert json.loads(out[out.index('{'):])["ignored_file_settings"] == []
+    assert wsp_config.keyless_public_allowed("keenable", _settings_config()) is True
+
+
+def test_profile_env_still_enables_public_tier_under_resolver(monkeypatch):
+    _resolver(monkeypatch)
+    assert wsp_config.keyless_public_allowed("keenable", _settings_config()) is False
+    _resolver(monkeypatch, {"KEENABLE_ALLOW_PUBLIC": "1"})
+    assert wsp_config.keyless_public_allowed("keenable", {}) is True

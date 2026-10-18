@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [v5.1.2] — 2026-10-18
+
+### Fixed
+
+- Search output: lines of a multi-line snippet or source summary are now indented like the URL line, and empty lines inside them are dropped, so page text such as `2. Install the build` no longer looks like the next result (or lets a page fake one). Line breaks inside a title or URL become spaces. Single-line snippets are unchanged. A golden test now freezes the search and extract text layout.
+
+- Extraction answers every requested URL: URLs past the per-call limit (`bounded_context.max_urls`, default 10) now get their own `not tried: limit of 10 URLs per call reached` row instead of disappearing from the tool, RPC and native output.
+
+- Batch extraction no longer throws away pages it already fetched when the provider hits a rate limit, runs out of credits or rejects the key partway through (seen with Firecrawl's free plan; Linkup, Serper and Keenable work the same way). WSP keeps those pages and stops calling that provider for the rest of the batch. The URL that hit the error and the URLs not yet tried get an error that names the cause, e.g. `not tried: provider rate limit reached`. Only those URLs go to the next provider. The attempt is reported as `partial`, keeps the error in its receipt and opens the circuit, so automatic routing backs off. Partial results are not cached. If the error comes on the first URL, the attempt fails as before. Serper and Keenable now report these errors to the circuit breaker; before, a 429 turned into a per-URL error on every URL. When the DonSeTch session fails partway through a batch, pages already fetched are kept.
+
+- `status` and `status --json` (new field `ignored_file_settings`) now say when `config.json` sets `<provider>.allow_public` (e.g. `keenable.allow_public`) or a SearXNG URL under Hermes, where both are ignored, and name the profile setting to use instead (`KEENABLE_ALLOW_PUBLIC`, `SEARXNG_INSTANCE_URL`). The URL itself is never printed. The user guide explains this too.
+
+### Added
+
+- The search header now ends with machine-readable `key=value` bits for apps that parse the text: `results=N` (results shown, also `results=0` on an empty call), `elapsed_ms=N` (time of this call; a cache hit reports its own time) and `fallback_from=a,b` (providers tried before the serving one, only when a fallback happened). Research mode adds `providers=a,b,c` and `pages=N`. Existing bits keep their wording and order; values are single tokens. The JSON, RPC and native outputs are unchanged.
+- A cache hit keeps how the entry was routed: `[Provider: keenable | cached 7s ago | auto-routed | low confidence | intent_general | results=5 | elapsed_ms=3]`. Entries cached before this version show no routing bits.
+
 ## [v5.1.1] — 2026-10-15
 
 ### Security

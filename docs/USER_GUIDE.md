@@ -101,6 +101,8 @@ Search-capable providers include You.com, Serper, Exa, Firecrawl, Tavily, Linkup
 
 Keenable is keyless: set `KEENABLE_API_KEY` for the authenticated endpoints, or opt into its public tier (off by default). Without any search key, setup asks whether to start on it (default no); or run `hermes web-search-plus setup keenable --keyless-public`; it writes `keenable.allow_public: true` to `config.json` (equivalently `KEENABLE_ALLOW_PUBLIC=1`).
 
+Under Hermes, `config.json` is shared between profiles, so `<provider>.allow_public` (e.g. `keenable.allow_public`) is ignored there. Set it in the profile instead with `hermes config set KEENABLE_ALLOW_PUBLIC 1`, then run `/reload`. `hermes web-search-plus status` lists any such ignored flag with the fix. The setup flag above is not affected when WSP runs outside Hermes (MCP, standalone CLI).
+
 DonSeTch is a different kind of keyless provider: it is a separately installed local MCP service rather than a public WSP endpoint. Set `hermes config set DONSETCH_BIN /absolute/path/to/donsetch` (or the DonSeTch binary field in Hermes Desktop), then call `provider="donsetch"` explicitly. DonSeTch stays outside automatic routing and fallback unless `hermes web-search-plus config set-auto-allow donsetch on` is set. See [DonSeTch local MCP provider](DONSETCH.md) before enabling it; keyless removes commercial credentials and request billing, not local resource use, outbound traffic, rate limits, or website policy obligations.
 
 With a `KEENABLE_API_KEY` set, requests always use the authenticated endpoints. Without a key and without the opt-in, Keenable is treated as unconfigured: it won't auto-route, fall back, or enable `web_extract_plus`. When the public tier is enabled, queries and fetched URLs are sent to an **unauthenticated** public service with per-IP limits and no SLA — roughly 1,000 requests/hour and 10 requests/second — so treat it as a best-effort last resort, not a dependable provider. The first request that uses the public endpoint logs a one-time warning so the egress is visible, and `web-search-plus doctor` reports keyless providers as `key=no` with a separate `keyless=on/off` badge so key status stays truthful.
@@ -124,7 +126,7 @@ hermes web-search-plus setup --preset self-hosted
 hermes web-search-plus status
 ```
 
-The preset records the profile and enables Keenable's existing keyless public tier. Set the optional SearXNG endpoint with `hermes config set SEARXNG_INSTANCE_URL <url>`. To configure it directly, use the canonical `searxng.base_url` name (legacy `searxng.instance_url` remains supported):
+The preset records the profile and enables Keenable's existing keyless public tier. Set the optional SearXNG endpoint with `hermes config set SEARXNG_INSTANCE_URL <url>` (then `/reload`). Under Hermes this is the only place it is read: a `searxng.base_url` or `searxng.instance_url` in `config.json` is ignored, because the URL can carry credentials and `config.json` is shared between profiles; `status` tells you when one is set. Outside Hermes (MCP, standalone CLI) you can configure it directly in `config.json`; use the canonical `searxng.base_url` name (legacy `searxng.instance_url` remains supported):
 
 ```json
 {
@@ -434,6 +436,22 @@ Parameter semantics:
 - `include_domains` / `exclude_domains`: domain filters, as a list or one string separated by commas or spaces. Providers with a domain field get them natively; Brave, Serper, SerpBase, You.com and Firecrawl get `site:` / `-site:` operators built from bare hostnames (`.gov` filters by suffix). An `include_domains` value without a usable domain is an error rather than an unrestricted search. Tavily cannot filter by a suffix such as `.gov` (it takes `*.example.com`); automatic search skips it for suffix filters.
 - `quality_report`: include routing diagnostics, skipped providers, result quality hints, and extraction recommendation.
 - `mode="research"`: query multiple providers and optionally extract selected URLs within a best-effort wall-clock budget.
+
+Reading the text output: after a security notice line, the header line names the serving provider, then how it was routed, then machine-readable `key=value` bits. Clients that parse the text should ignore bits they do not know.
+
+```text
+[Provider: exa | auto-routed | low confidence | intent_general | results=1 | elapsed_ms=37 | fallback_from=serper,brave]
+[Provider: serper | cached 7s ago | auto-routed | low confidence | intent_general | results=1 | elapsed_ms=3]
+[Provider: research | auto-routed | low confidence | intent_general | providers=brave,exa,keenable | pages=3 | results=5 | elapsed_ms=12400]
+```
+
+- `results`: results in this output, also `0` for a search that found nothing.
+- `elapsed_ms`: wall time of this call; for a cache hit, the time of the lookup.
+- `fallback_from`: providers that failed or came back empty before the serving one, in order. Absent without a fallback.
+- `providers` and `pages` (research only): the providers whose results were merged and the number of pages read.
+- A cache hit repeats how the cached search was routed. Entries cached before 5.1.2 show no routing.
+
+Each result is `N. title` (with `[published YYYY-MM-DD]` when known), then the URL and the snippet indented by three spaces, then a blank line. Every snippet line is indented, so page text can never start a line of its own.
 
 ## Using `web_extract_plus`
 
