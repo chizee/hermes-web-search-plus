@@ -1,11 +1,11 @@
 """
-web-search-plus — Hermes Plugin v5.1.3
+web-search-plus — Hermes Plugin v5.1.4
 Multi-provider web search, URL extraction, quality reports, and opt-in research mode.
 Ported from robbyczgw-cla/web-search-plus-plugin (OpenClaw) to Hermes Plugin API.
 """
 from __future__ import annotations
 
-__version__ = "5.1.3"
+__version__ = "5.1.4"
 
 import argparse
 import importlib
@@ -1091,7 +1091,7 @@ def _donsetch_status(env: Mapping[str, str], config: Mapping[str, Any]) -> Dict[
         return {
             "state": "missing",
             "version": None,
-            "tested_version": "4.7.0",
+            "tested_version": "4.10.1",
             "compatibility": "unknown",
             "binary_configured": bool(_clean_env_value(env.get("DONSETCH_BIN") or "")),
         }
